@@ -10,6 +10,9 @@ package io.element.android.features.call.impl.ui
 import android.Manifest
 import android.app.PictureInPictureParams
 import android.content.Intent
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.media.AudioManager.OnCommunicationDeviceChangedListener
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
@@ -32,6 +35,7 @@ import androidx.core.content.IntentCompat
 import androidx.core.content.getSystemService
 import androidx.core.util.Consumer
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
 import io.element.android.features.call.api.CallType
 import io.element.android.features.call.api.CallType.ExternalUrl
 import io.element.android.features.call.impl.DefaultElementCallEntryPoint
@@ -51,7 +55,12 @@ import io.element.android.libraries.core.log.logger.LoggerTag
 import io.element.android.libraries.core.meta.BuildMeta
 import io.element.android.libraries.designsystem.theme.ElementThemeApp
 import io.element.android.libraries.preferences.api.store.AppPreferencesStore
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.onEach
 import timber.log.Timber
+import java.util.concurrent.Executors
 import javax.inject.Inject
 
 private val loggerTag = LoggerTag("ElementCallActivity")
@@ -77,12 +86,6 @@ class ElementCallActivity :
     private val webViewTarget = mutableStateOf<CallType?>(null)
 
     private var eventSink: ((CallScreenEvents) -> Unit)? = null
-
-    private val proximitySensorWakeLock: PowerManager.WakeLock? by lazy {
-        getSystemService<PowerManager>()
-            ?.takeIf { it.isWakeLockLevelSupported(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK) }
-            ?.newWakeLock(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK, "$packageName:ProximitySensorCallWakeLock")
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -137,26 +140,6 @@ class ElementCallActivity :
                     }
                 )
             }
-        }
-    }
-
-    override fun onStart() {
-        super.onStart()
-
-        if (proximitySensorWakeLock?.isHeld == false) {
-            val proximitySensorEnabled = proximitySensorWakeLock?.acquire()
-            Timber.d("Proximity sensor wake lock acquired: $proximitySensorEnabled")
-        } else {
-            Timber.d("Proximity sensor wakelock does not exist or is already held")
-        }
-    }
-
-    override fun onStop() {
-        super.onStop()
-
-        if (proximitySensorWakeLock?.isHeld == true) {
-            proximitySensorWakeLock?.release()
-            Timber.d("Proximity sensor wake lock released")
         }
     }
 

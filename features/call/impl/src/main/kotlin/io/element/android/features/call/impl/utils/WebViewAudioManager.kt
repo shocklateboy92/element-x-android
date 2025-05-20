@@ -12,14 +12,18 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Build
+import android.os.PowerManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import androidx.core.content.getSystemService
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
+import kotlinx.serialization.json.Json
 import timber.log.Timber
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.exp
 
 class WebViewAudioManager(
     private val webView: WebView,
@@ -43,6 +47,12 @@ class WebViewAudioManager(
 
     private val audioManager = webView.context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
+    private val proximitySensorWakeLock by lazy {
+        webView.context.getSystemService<PowerManager>()
+            ?.takeIf { it.isWakeLockLevelSupported(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK) }
+            ?.newWakeLock(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK, "${webView.context.packageName}:ProximitySensorCallWakeLock")
+    }
+
     private val commsDeviceChangedListener = AudioManager.OnCommunicationDeviceChangedListener { device ->
         if (device?.id == expectedNewCommunicationDeviceId) {
             if (device != null) {
@@ -65,19 +75,38 @@ class WebViewAudioManager(
 
     private val audioDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-            setAvailableAudioDevices()
-            // TODO: maybe only change the selected device to a new external one
-            selectDefaultAudioDevice()
+            val validNewDevices = addedDevices.orEmpty().filter { it.type in wantedDeviceTypes && it.isSink }
+            if (validNewDevices.isEmpty()) return
+
+            val audioDevices = (listAudioDevices() + validNewDevices).distinctBy { it.id }
+            setAvailableAudioDevices(audioDevices.map(SerializableAudioDevice::fromAudioDeviceInfo))
+            // This should automatically switch to a new device if it has a higher priority than the current one
+            selectDefaultAudioDevice(audioDevices)
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+            // Update the available devices
             setAvailableAudioDevices()
-            // TODO: maybe only change the selected device if it was one of the added devices
-            selectDefaultAudioDevice()
+
+            // Unless the removed device is the current one, we don't need to do anything else
+            val removedCurrentDevice = removedDevices.orEmpty().any { it.id == currentDeviceId }
+            if (!removedCurrentDevice) return
+
+            val previousDevice = previousSelectedDevice
+            if (previousDevice != null) {
+                previousSelectedDevice = null
+                // If we have a previous device, we should select it again
+                audioManager.selectAudioDevice(previousDevice.id.toString())
+            } else {
+                // If we don't have a previous device, we should select the default one
+                selectDefaultAudioDevice()
+            }
         }
     }
 
+    private var currentDeviceId: Int? = null
     private var expectedNewCommunicationDeviceId: Int? = null
+    private var previousSelectedDevice: AudioDeviceInfo? = null
 
     val isInCallMode = AtomicBoolean(false)
 
@@ -123,6 +152,10 @@ class WebViewAudioManager(
             audioManager.removeOnCommunicationDeviceChangedListener(commsDeviceChangedListener)
         }
 
+        if (proximitySensorWakeLock?.isHeld == true) {
+            proximitySensorWakeLock?.release()
+        }
+
         audioManager.mode = AudioManager.MODE_NORMAL
     }
 
@@ -131,49 +164,45 @@ class WebViewAudioManager(
         webView.evaluateJavascript("controls.onOutputDeviceSelect = (id) => { onAudioDeviceSelectedCallback.setOutputDevice(id); };", null)
     }
 
-    private fun setAvailableAudioDevices() {
-        val devices = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            audioManager.availableCommunicationDevices.map(CompatAudioDevice::fromAudioDeviceInfo)
+    private fun listAudioDevices(): List<AudioDeviceInfo> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.availableCommunicationDevices
         } else {
             val rawAudioDevices = audioManager.getDevices(AudioManager.GET_DEVICES_ALL)
-            rawAudioDevices.filter { it.type in wantedDeviceTypes && it.isSink }.map { CompatAudioDevice.fromAudioDeviceInfo(it) }
+            rawAudioDevices.filter { it.type in wantedDeviceTypes && it.isSink }
         }
+    }
+
+    private fun setAvailableAudioDevices(
+        devices: List<SerializableAudioDevice> = listAudioDevices().map(SerializableAudioDevice::fromAudioDeviceInfo),
+    ) {
         Timber.d("Updating available audio devices")
-        val deviceList = devices.joinToString(",") { "{ 'id': '${it.id}', 'name': '${deviceName(it.type, it.name)}' }" }
-        webView.evaluateJavascript("controls.setAvailableOutputDevices([$deviceList]);", {
+        val jsonSerializer = Json {
+            encodeDefaults = true
+            explicitNulls = false
+        }
+        val deviceList = jsonSerializer.encodeToString(devices)
+        webView.evaluateJavascript("controls.setAvailableOutputDevices($deviceList);", {
             Timber.d("Audio: setAvailableOutputDevices result: $it")
         })
     }
 
     private fun registerWebViewDeviceSelectedCallback() {
-        val webViewAudioDeviceSelectedCallback = WebViewAudioOutputCallback {
-            Timber.d("Audio device selected in webview, id: $it")
-            audioManager.selectAudioDevice(it)
+        val webViewAudioDeviceSelectedCallback = WebViewAudioOutputCallback { selectedDeviceId ->
+            Timber.d("Audio device selected in webview, id: $selectedDeviceId")
+            previousSelectedDevice = listAudioDevices().find { it.id.toString() == selectedDeviceId }
+            audioManager.selectAudioDevice(selectedDeviceId)
         }
         Timber.d("Setting onAudioDeviceSelectedCallback javascript interface in webview")
         webView.addJavascriptInterface(webViewAudioDeviceSelectedCallback, "onAudioDeviceSelectedCallback")
     }
 
-    @Suppress("DEPRECATION")
-    private fun selectDefaultAudioDevice() {
-        val selectedDevice = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val devices = audioManager.availableCommunicationDevices
-            devices.minByOrNull {
-                wantedDeviceTypes.indexOf(it.type).let { index ->
-                    // If the device type is not in the wantedDeviceTypes list, we give it a low priority
-                    if (index == -1) Int.MAX_VALUE else index
-                }
+    private fun selectDefaultAudioDevice(availableDevices: List<AudioDeviceInfo> = listAudioDevices()) {
+        val selectedDevice = availableDevices.minByOrNull {
+            wantedDeviceTypes.indexOf(it.type).let { index ->
+                // If the device type is not in the wantedDeviceTypes list, we give it a low priority
+                if (index == -1) Int.MAX_VALUE else index
             }
-        } else {
-            // If we don't have access to the new APIs, use the deprecated ones
-            val devices = audioManager.getDevices(AudioManager.GET_DEVICES_ALL)
-            devices.filter { it.isSink }
-                .minByOrNull {
-                    wantedDeviceTypes.indexOf(it.type).let { index ->
-                        // If the device type is not in the wantedDeviceTypes list, we give it a low priority
-                        if (index == -1) Int.MAX_VALUE else index
-                    }
-                }
         }
 
         expectedNewCommunicationDeviceId = selectedDevice?.id
@@ -189,32 +218,45 @@ class WebViewAudioManager(
     private fun selectAudioDeviceInWebView(deviceId: String) {
         MainScope().launch { webView.evaluateJavascript("controls.setOutputDevice('$deviceId');", null) }
     }
-}
 
-private fun AudioManager.selectAudioDevice(device: String) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        val audioDevice = availableCommunicationDevices.find { it.id.toString() == device }
-        selectAudioDevice(audioDevice)
-    } else {
-        val rawAudioDevices = getDevices(AudioManager.GET_DEVICES_ALL)
-        val audioDevice = rawAudioDevices.find { it.id.toString() == device }
-        selectAudioDevice(audioDevice)
-    }
-}
-
-private fun AudioManager.selectAudioDevice(device: AudioDeviceInfo?) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        if (device != null) {
-            setCommunicationDevice(device)
+    private fun AudioManager.selectAudioDevice(device: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val audioDevice = availableCommunicationDevices.find { it.id.toString() == device }
+            selectAudioDevice(audioDevice)
         } else {
-            Timber.w("Audio: unable to select audio device with id: ${device?.id}")
+            val rawAudioDevices = getDevices(AudioManager.GET_DEVICES_ALL)
+            val audioDevice = rawAudioDevices.find { it.id.toString() == device }
+            selectAudioDevice(audioDevice)
         }
-    } else {
-        if (device != null) {
-            isSpeakerphoneOn = device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-            isBluetoothScoOn = device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+    }
+
+    private fun AudioManager.selectAudioDevice(device: AudioDeviceInfo?) {
+        currentDeviceId = device?.id
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (device != null) {
+                if (device != communicationDevice) {
+                setCommunicationDevice(device)
+                }
+            } else {
+                audioManager.clearCommunicationDevice()
+            }
         } else {
-            Timber.w("Audio: unable to select audio device with id: ${device?.id}")
+            if (device != null) {
+                isSpeakerphoneOn = device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                isBluetoothScoOn = device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            } else {
+                isSpeakerphoneOn = false
+                isBluetoothScoOn = false
+            }
+        }
+
+        @Suppress("WakeLock", "WakeLockTimeout")
+        if (device?.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE && proximitySensorWakeLock?.isHeld == false) {
+            // If the device is the built-in earpiece, we need to acquire the proximity sensor wake lock
+            proximitySensorWakeLock?.acquire()
+        } else if (proximitySensorWakeLock?.isHeld == true) {
+            // If the device is no longer the earpiece, we need to release the wake lock
+            proximitySensorWakeLock?.release()
         }
     }
 }
@@ -245,12 +287,7 @@ private fun deviceName(type: Int, name: String): String {
     return if (isBuiltIn(type)) {
         typePart
     } else {
-        val namePart = if (name.length > 10) {
-            name.substring(0, 10) + "…"
-        } else {
-            name
-        }
-        "$namePart - $typePart"
+        "$typePart - $name"
     }
 }
 
@@ -262,15 +299,19 @@ private fun isBuiltIn(type: Int): Boolean = when (type) {
     else -> false
 }
 
-
-data class CompatAudioDevice(
+@Suppress("unused")
+@Serializable
+class SerializableAudioDevice(
     val id: String,
     val name: String,
-    val type: Int,
+    @Transient val type: Int = 0,
+    val isEarpiece: Boolean = type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE,
+    val isSpeaker: Boolean = type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER,
+    val isExternalHeadset: Boolean = type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
 ) {
     companion object {
-        fun fromAudioDeviceInfo(audioDeviceInfo: AudioDeviceInfo): CompatAudioDevice {
-            return CompatAudioDevice(
+        fun fromAudioDeviceInfo(audioDeviceInfo: AudioDeviceInfo): SerializableAudioDevice {
+            return SerializableAudioDevice(
                 id = audioDeviceInfo.id.toString(),
                 name = deviceName(type = audioDeviceInfo.type, name = audioDeviceInfo.productName.toString()),
                 type = audioDeviceInfo.type,
