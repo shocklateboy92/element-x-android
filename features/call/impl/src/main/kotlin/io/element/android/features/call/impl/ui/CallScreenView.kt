@@ -53,7 +53,6 @@ import io.element.android.libraries.designsystem.theme.components.Scaffold
 import io.element.android.libraries.designsystem.theme.components.Text
 import io.element.android.libraries.designsystem.theme.components.TopAppBar
 import io.element.android.libraries.ui.strings.CommonStrings
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
@@ -126,11 +125,10 @@ internal fun CallScreenView(
                 onWebViewCreated = { webView ->
                     val interceptor = WebViewWidgetMessageInterceptor(
                         webView = webView,
-                        onUrlLoaded = {
+                        onUrlLoaded = { url ->
                             coroutineScope.launch {
-                                delay(1000)
                                 if (webViewAudioManager?.isInCallMode?.get() == false) {
-                                    Timber.d("Loaded URL: $it, starting in-call audio mode")
+                                    Timber.d("URL $url is loaded, starting in-call audio mode")
                                     webViewAudioManager?.onCallStarted()
                                 } else {
                                     Timber.d("Can't start in-call audio mode since the app is already in it.")

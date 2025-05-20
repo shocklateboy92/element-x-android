@@ -48,8 +48,6 @@ class WebViewWidgetMessageInterceptor(
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
 
-                onUrlLoaded(url)
-
                 // Due to https://github.com/element-hq/element-x-android/issues/4097
                 // we need to supply a logging implementation that correctly includes
                 // objects in log lines.
@@ -91,6 +89,10 @@ class WebViewWidgetMessageInterceptor(
                     """.trimIndent(),
                     null
                 )
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                url?.let(onUrlLoaded)
             }
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
