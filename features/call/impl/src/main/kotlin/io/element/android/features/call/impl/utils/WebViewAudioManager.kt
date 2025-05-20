@@ -19,6 +19,7 @@ import kotlinx.coroutines.launch
 import timber.log.Timber
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.exp
 
 class WebViewAudioManager(
     private val webView: WebView,
@@ -43,11 +44,22 @@ class WebViewAudioManager(
     private val audioManager = webView.context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     private val commsDeviceChangedListener = AudioManager.OnCommunicationDeviceChangedListener { device ->
-        if (device != null) {
-            Timber.d("Audio device changed, type: ${device.type}")
-            MainScope().launch { selectAudioDeviceInWebView(device.id.toString()) }
+        if (device?.id == expectedNewCommunicationDeviceId) {
+            if (device != null) {
+                expectedNewCommunicationDeviceId = null
+                Timber.d("Audio device changed, type: ${device.type}")
+                selectAudioDeviceInWebView(device.id.toString())
+            } else {
+                Timber.d("No audio device selected")
+            }
         } else {
-            Timber.d("No audio device selected")
+            // We were expecting a device change but it didn't happen, so we should retry
+            val expectedDeviceId = expectedNewCommunicationDeviceId
+            if (expectedDeviceId != null) {
+                // Remove the expected id so we only retry once
+                expectedNewCommunicationDeviceId = null
+                audioManager.selectAudioDevice(expectedDeviceId.toString())
+            }
         }
     }
 
@@ -65,7 +77,13 @@ class WebViewAudioManager(
         }
     }
 
+    private var expectedNewCommunicationDeviceId: Int? = null
+
     val isInCallMode = AtomicBoolean(false)
+
+    init {
+        registerWebViewDeviceSelectedCallback()
+    }
 
     fun onCallStarted() {
         if (!isInCallMode.compareAndSet(false, true)) {
@@ -78,10 +96,10 @@ class WebViewAudioManager(
         // TODO: double check used audio stream
         audioManager.mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             // Set 'voice call' mode so volume keys actually control the call volume
-             AudioManager.MODE_NORMAL
+            AudioManager.MODE_IN_COMMUNICATION
         } else {
             // Workaround for Android 12 and lower, otherwise changing the audio device doesn't work
-            AudioManager.MODE_IN_COMMUNICATION
+            AudioManager.MODE_NORMAL
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -90,9 +108,9 @@ class WebViewAudioManager(
 
         audioManager.registerAudioDeviceCallback(audioDeviceCallback, null)
 
-        addWebViewAudioOutputCallback()
         setAvailableAudioDevices()
         selectDefaultAudioDevice()
+        setWebViewOnAudioDeviceSelectedCallback()
     }
 
     fun onCallStopped() {
@@ -108,6 +126,11 @@ class WebViewAudioManager(
         audioManager.mode = AudioManager.MODE_NORMAL
     }
 
+    private fun setWebViewOnAudioDeviceSelectedCallback() {
+        Timber.d("Adding callback in controls.onOutputDeviceSelect")
+        webView.evaluateJavascript("controls.onOutputDeviceSelect = (id) => { onAudioDeviceSelectedCallback.setOutputDevice(id); };", null)
+    }
+
     private fun setAvailableAudioDevices() {
         val devices = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             audioManager.availableCommunicationDevices.map(CompatAudioDevice::fromAudioDeviceInfo)
@@ -115,21 +138,20 @@ class WebViewAudioManager(
             val rawAudioDevices = audioManager.getDevices(AudioManager.GET_DEVICES_ALL)
             rawAudioDevices.filter { it.type in wantedDeviceTypes && it.isSink }.map { CompatAudioDevice.fromAudioDeviceInfo(it) }
         }
+        Timber.d("Updating available audio devices")
         val deviceList = devices.joinToString(",") { "{ 'id': '${it.id}', 'name': '${deviceName(it.type, it.name)}' }" }
         webView.evaluateJavascript("controls.setAvailableOutputDevices([$deviceList]);", {
             Timber.d("Audio: setAvailableOutputDevices result: $it")
         })
     }
 
-    private fun addWebViewAudioOutputCallback() {
-        val webViewAudioOutputCallback = WebViewAudioOutputCallback {
+    private fun registerWebViewDeviceSelectedCallback() {
+        val webViewAudioDeviceSelectedCallback = WebViewAudioOutputCallback {
             Timber.d("Audio device selected in webview, id: $it")
             audioManager.selectAudioDevice(it)
         }
-        Timber.d("Setting setOutputDeviceCallback javascript interface in webview")
-        webView.addJavascriptInterface(webViewAudioOutputCallback, "setOutputDeviceCallback")
-        Timber.d("Adding callback in controls.onOutputDeviceSelect")
-        webView.evaluateJavascript("controls.onOutputDeviceSelect = (id) => { setOutputDeviceCallback.setOutputDevice(id); };", null)
+        Timber.d("Setting onAudioDeviceSelectedCallback javascript interface in webview")
+        webView.addJavascriptInterface(webViewAudioDeviceSelectedCallback, "onAudioDeviceSelectedCallback")
     }
 
     @Suppress("DEPRECATION")
@@ -154,6 +176,7 @@ class WebViewAudioManager(
                 }
         }
 
+        expectedNewCommunicationDeviceId = selectedDevice?.id
         audioManager.selectAudioDevice(selectedDevice)
 
         selectedDevice?.let {
@@ -164,18 +187,7 @@ class WebViewAudioManager(
     }
 
     private fun selectAudioDeviceInWebView(deviceId: String) {
-        webView.evaluateJavascript("controls.setOutputDevice('$deviceId');", null)
-    }
-}
-
-private class WebViewAudioOutputCallback(
-    private val callback: (String) -> Unit,
-) {
-    @JavascriptInterface
-    fun setOutputDevice(id: String) {
-        Timber.d("Audio device selected in webview, id: $id")
-        callback(id)
-
+        MainScope().launch { webView.evaluateJavascript("controls.setOutputDevice('$deviceId');", null) }
     }
 }
 
@@ -204,6 +216,17 @@ private fun AudioManager.selectAudioDevice(device: AudioDeviceInfo?) {
         } else {
             Timber.w("Audio: unable to select audio device with id: ${device?.id}")
         }
+    }
+}
+
+private class WebViewAudioOutputCallback(
+    private val callback: (String) -> Unit,
+) {
+    @JavascriptInterface
+    fun setOutputDevice(id: String) {
+        Timber.d("Audio device selected in webview, id: $id")
+        callback(id)
+
     }
 }
 

@@ -127,9 +127,14 @@ internal fun CallScreenView(
                     val interceptor = WebViewWidgetMessageInterceptor(
                         webView = webView,
                         onUrlLoaded = {
-                            if (webViewAudioManager?.isInCallMode?.get() == false) {
-                                Timber.d("Loaded URL: $it, starting in-call audio mode")
-                                webViewAudioManager?.onCallStarted()
+                            coroutineScope.launch {
+                                delay(1000)
+                                if (webViewAudioManager?.isInCallMode?.get() == false) {
+                                    Timber.d("Loaded URL: $it, starting in-call audio mode")
+                                    webViewAudioManager?.onCallStarted()
+                                } else {
+                                    Timber.d("Can't start in-call audio mode since the app is already in it.")
+                                }
                             }
                         },
                         onError = { state.eventSink(CallScreenEvents.OnWebViewError(it)) },
